@@ -1,39 +1,61 @@
 import streamlit as st
 import pandas as pd
-import re
+from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from datetime import datetime
+import json
 
-st.set_page_config(page_title="Demand vs Bench Matching", layout="wide")
+st.set_page_config(page_title="AI Demand Matching", layout="wide")
 
-st.title("🚀 GenAI Demand vs Bench Matching Tool")
-
-
-# ============================
-# SKILL EXTRACTION (NO HARDCODE)
-# ============================
-
-def extract_skills(text):
-    if not text:
-        return []
-
-    text = str(text).lower()
-    words = re.findall(r'\b[a-zA-Z\.\#\+]+\b', text)
-
-    stop_words = {"and", "or", "with", "the", "in", "for", "to"}
-
-    return [w for w in words if w not in stop_words and len(w) > 2]
-
+st.title("🚀 AI Demand vs Bench Matching Tool")
 
 # ============================
-# LOAD MODEL (CACHED)
+# LOAD API + MODEL
 # ============================
+
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 @st.cache_resource
 def load_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
+# ============================
+# OPENAI SKILL EXTRACTION
+# ============================
+
+@st.cache_data
+def extract_skills_ai(text):
+
+    prompt = f"""
+    Extract technical skills from this text.
+
+    Identify:
+    - primary_skill (main technology)
+    - secondary_skills (other technologies)
+
+    Text:
+    {text}
+
+    Return JSON:
+    {{
+      "primary_skill": "",
+      "secondary_skills": []
+    }}
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+
+        content = response.choices[0].message.content
+        return json.loads(content)
+
+    except:
+        return {"primary_skill": "", "secondary_skills": []}
 
 # ============================
 # FILE UPLOAD
@@ -47,15 +69,14 @@ if demand_file and bench_file:
     demand_df = pd.read_excel(demand_file)
     bench_df = pd.read_excel(bench_file, sheet_name="Base Data")
 
-    # normalize columns
     demand_df.columns = demand_df.columns.str.strip().str.lower()
     bench_df.columns = bench_df.columns.str.strip().str.lower()
 
-    st.success("✅ Files uploaded successfully")
+    st.success("✅ Files uploaded")
 
     if st.button("🔍 Run Matching"):
 
-        with st.spinner("Running AI Matching..."):
+        with st.spinner("Processing..."):
 
             model = load_model()
 
@@ -74,44 +95,44 @@ if demand_file and bench_file:
                 bench_df["status"].str.lower().isin(valid_status)
             ].copy()
 
-
             # ============================
-            # TEXT BUILDERS
+            # BUILD TEXT
             # ============================
-
-            def normalize(text):
-                if pd.isna(text):
-                    return ""
-                text = str(text).lower()
-                text = text.replace("dot net", ".net")
-                text = text.replace("asp.net", ".net")
-                text = text.replace(".net core", ".net")
-                text = text.replace("vb.net", ".net")
-                text = text.replace("sql server", "sql")
-                return text
-
 
             def build_demand_text(row):
-                return " ".join(filter(None, [
-                    normalize(row.get("requirement title")),
-                    normalize(row.get("skill category")),
-                    normalize(row.get("high level requirements")),
-                    normalize(row.get("location"))
-                ]))
-
+                return " ".join([
+                    str(row.get("requirement title", "")),
+                    str(row.get("high level requirements", "")),
+                    str(row.get("skill category", ""))
+                ])
 
             def build_bench_text(row):
-                return " ".join(filter(None, [
-                    normalize(row.get("primary skills")),
-                    normalize(row.get("sec. skills")),
-                    normalize(row.get("practice skill group")),
-                    normalize(row.get("exp")),
-                    normalize(row.get("current location"))
-                ]))
-
+                return " ".join([
+                    str(row.get("primary skills", "")),
+                    str(row.get("sec. skills", "")),
+                    str(row.get("practice skill group", ""))
+                ])
 
             # ============================
-            # CREATE EMBEDDINGS
+            # EXTRACT SKILLS (ONCE ONLY)
+            # ============================
+
+            st.info("Extracting skills using AI...")
+
+            demand_skill_map = {}
+            for _, row in demand_df.iterrows():
+                did = row.get("requisition id")
+                text = build_demand_text(row)
+                demand_skill_map[did] = extract_skills_ai(text)
+
+            bench_skill_map = {}
+            for _, row in bench_df.iterrows():
+                eid = row.get("emp_id")
+                text = build_bench_text(row)
+                bench_skill_map[eid] = extract_skills_ai(text)
+
+            # ============================
+            # EMBEDDINGS
             # ============================
 
             demand_embeddings = {}
@@ -119,7 +140,7 @@ if demand_file and bench_file:
                 did = row.get("requisition id")
                 text = build_demand_text(row)
 
-                if did and len(text.strip()) > 10:
+                if did:
                     demand_embeddings[did] = model.encode(text)
 
             bench_embeddings = {}
@@ -127,67 +148,49 @@ if demand_file and bench_file:
                 eid = row.get("emp_id")
                 text = build_bench_text(row)
 
-                if eid and len(text.strip()) > 10:
+                if eid:
                     bench_embeddings[eid] = model.encode(text)
 
             # ============================
-            # MATCHING LOGIC (IMPROVED)
+            # MATCHING
             # ============================
 
             results = []
-            SIMILARITY_THRESHOLD = 0.20
 
             for _, demand in demand_df.iterrows():
 
                 did = demand.get("requisition id")
                 d_emb = demand_embeddings.get(did)
+                d_skills = demand_skill_map.get(did)
 
-                if d_emb is None:
+                if not d_emb or not d_skills:
                     continue
-
-                demand_text = build_demand_text(demand)
-                demand_skills = extract_skills(demand_text)
 
                 for _, bench in bench_df.iterrows():
 
                     eid = bench.get("emp_id")
                     b_emb = bench_embeddings.get(eid)
+                    b_skills = bench_skill_map.get(eid)
 
-                    if b_emb is None:
+                    if not b_emb or not b_skills:
                         continue
 
-                    bench_text = build_bench_text(bench)
-                    bench_skills = extract_skills(bench_text)
-
-                    # ============================
-                    # 🔥 SKILL VALIDATION (KEY FIX)
-                    # ============================
-
-                    common_skills = set(demand_skills).intersection(set(bench_skills))
-
-                    # 🔴 FILTER BAD MATCHES
-                    if len(common_skills) < 2:
+                    # 🔥 PRIMARY SKILL MATCH (KEY FIX)
+                    if d_skills["primary_skill"] != b_skills["primary_skill"]:
                         continue
 
-                    # ============================
-                    # AI SIMILARITY
-                    # ============================
+                    # AI similarity
+                    score = cosine_similarity([b_emb], [d_emb])[0][0]
 
-                    ai_score = cosine_similarity([b_emb], [d_emb])[0][0]
-
-                    if ai_score < SIMILARITY_THRESHOLD:
+                    if score < 0.25:
                         continue
-
-                    final_score = ai_score
 
                     results.append({
                         "Requisition ID": did,
                         "Emp_ID": eid,
                         "Name": bench.get("name"),
-                        "Primary Skills": bench.get("primary skills"),
-                        "Location": bench.get("current location"),
-                        "Common Skills": ", ".join(common_skills),
-                        "Match %": round(final_score * 100, 2)
+                        "Primary Skill": b_skills["primary_skill"],
+                        "Match %": round(score * 100, 2)
                     })
 
             # ============================
@@ -208,9 +211,9 @@ if demand_file and bench_file:
                 top5_df = result_df.groupby("Requisition ID").head(5)
 
                 st.success(f"✅ {len(top5_df)} matches found")
-                st.dataframe(top5_df, use_container_width=True)
+                st.dataframe(top5_df)
 
-                file_name = f"Available_Resources_{datetime.now().strftime('%H%M%S')}.xlsx"
+                file_name = f"output_{datetime.now().strftime('%H%M%S')}.xlsx"
                 top5_df.to_excel(file_name, index=False)
 
                 with open(file_name, "rb") as f:
