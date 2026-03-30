@@ -1,5 +1,0 @@
-streamlit
-pandas
-sentence-transformers==2.2.2
-scikit-learn
-openpyxl
