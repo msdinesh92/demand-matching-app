@@ -7,7 +7,6 @@ from datetime import datetime
 import json
 
 st.set_page_config(page_title="AI Demand Matching", layout="wide")
-
 st.title("🚀 AI Demand vs Bench Matching Tool")
 
 # ============================
@@ -20,24 +19,28 @@ client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 def load_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
+
 # ============================
-# OPENAI SKILL EXTRACTION
+# OPENAI SKILL EXTRACTION (CACHED)
 # ============================
 
-@st.cache_data
+@st.cache_data(ttl=86400, show_spinner=False)
 def extract_skills_ai(text):
+
+    if not text or str(text).strip() == "":
+        return {"primary_skill": "", "secondary_skills": []}
 
     prompt = f"""
     Extract technical skills from this text.
 
     Identify:
-    - primary_skill (main technology)
-    - secondary_skills (other technologies)
+    - primary_skill (main technology like React, .NET, Java, Python)
+    - secondary_skills (other tools/skills)
 
     Text:
     {text}
 
-    Return JSON:
+    Return only JSON:
     {{
       "primary_skill": "",
       "secondary_skills": []
@@ -51,11 +54,17 @@ def extract_skills_ai(text):
             temperature=0
         )
 
-        content = response.choices[0].message.content
+        content = response.choices[0].message.content.strip()
+
+        # Fix for bad JSON responses
+        if content.startswith("```"):
+            content = content.split("```")[1]
+
         return json.loads(content)
 
     except:
         return {"primary_skill": "", "secondary_skills": []}
+
 
 # ============================
 # FILE UPLOAD
@@ -114,10 +123,10 @@ if demand_file and bench_file:
                 ])
 
             # ============================
-            # EXTRACT SKILLS (ONCE ONLY)
+            # EXTRACT SKILLS (ONCE)
             # ============================
 
-            st.info("Extracting skills using AI...")
+            st.info("🔍 Extracting skills (first run may take time)...")
 
             demand_skill_map = {}
             for _, row in demand_df.iterrows():
@@ -163,7 +172,8 @@ if demand_file and bench_file:
                 d_emb = demand_embeddings.get(did)
                 d_skills = demand_skill_map.get(did)
 
-                if not d_emb or not d_skills:
+                # ✅ FIXED ERROR HERE
+                if d_emb is None or d_skills is None:
                     continue
 
                 for _, bench in bench_df.iterrows():
@@ -172,14 +182,21 @@ if demand_file and bench_file:
                     b_emb = bench_embeddings.get(eid)
                     b_skills = bench_skill_map.get(eid)
 
-                    if not b_emb or not b_skills:
+                    # ✅ FIXED ERROR HERE
+                    if b_emb is None or b_skills is None:
                         continue
 
-                    # 🔥 PRIMARY SKILL MATCH (KEY FIX)
+                    # ============================
+                    # PRIMARY SKILL MATCH (STRICT)
+                    # ============================
+
                     if d_skills["primary_skill"] != b_skills["primary_skill"]:
                         continue
 
-                    # AI similarity
+                    # ============================
+                    # AI SIMILARITY
+                    # ============================
+
                     score = cosine_similarity([b_emb], [d_emb])[0][0]
 
                     if score < 0.25:
@@ -211,9 +228,9 @@ if demand_file and bench_file:
                 top5_df = result_df.groupby("Requisition ID").head(5)
 
                 st.success(f"✅ {len(top5_df)} matches found")
-                st.dataframe(top5_df)
+                st.dataframe(top5_df, use_container_width=True)
 
-                file_name = f"output_{datetime.now().strftime('%H%M%S')}.xlsx"
+                file_name = f"Available_Resources_{datetime.now().strftime('%H%M%S')}.xlsx"
                 top5_df.to_excel(file_name, index=False)
 
                 with open(file_name, "rb") as f:
